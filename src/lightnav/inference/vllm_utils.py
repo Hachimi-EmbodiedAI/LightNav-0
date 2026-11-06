@@ -17,8 +17,18 @@ from lightnav.inference.model import resolve_model_paths
 # Qwen3VLForConditionalGeneration.get_mrope_input_positions). These move across minor
 # versions and can drift across patch releases. Verified end-to-end against vllm 0.19.1
 # / transformers 5.8.0. Set LIGHTNAV_SKIP_VERSION_GUARD=1 to bypass at your own risk.
-_VLLM_SUPPORTED_PREFIX = "0.19."
-_TRANSFORMERS_SUPPORTED_PREFIX = "5.8."
+#
+# transformers: both 5.8 and the 4.57 line are supported. vllm 0.19.1 allows 5.8;
+# vllm 0.19.0 (the only build with native sm_87 kernels for Jetson Orin) pins <5, so
+# 4.57 is the realistic pair there. The only API difference the patch touches is
+# Qwen3VLModel.get_rope_index's mm_token_type_ids argument, handled by
+# lightnav.inference.rope_compat.
+_VLLM_SUPPORTED_PREFIXES = ("0.19.",)
+_TRANSFORMERS_SUPPORTED_PREFIXES = ("5.8.", "4.57.")
+
+# Kept for callers that imported the singular names.
+_VLLM_SUPPORTED_PREFIX = _VLLM_SUPPORTED_PREFIXES[0]
+_TRANSFORMERS_SUPPORTED_PREFIX = _TRANSFORMERS_SUPPORTED_PREFIXES[0]
 
 
 def _assert_vllm_version() -> None:
@@ -28,22 +38,23 @@ def _assert_vllm_version() -> None:
         return
     from importlib.metadata import PackageNotFoundError, version
 
-    for pkg, prefix in (
-        ("vllm", _VLLM_SUPPORTED_PREFIX),
-        ("transformers", _TRANSFORMERS_SUPPORTED_PREFIX),
+    for pkg, prefixes in (
+        ("vllm", _VLLM_SUPPORTED_PREFIXES),
+        ("transformers", _TRANSFORMERS_SUPPORTED_PREFIXES),
     ):
+        want = " or ".join(f"{p}x" for p in prefixes)
         try:
             found = version(pkg)
         except PackageNotFoundError:
             raise RuntimeError(
-                f"lightnav vllm_local backend requires {pkg} {prefix}x but {pkg} is not "
+                f"lightnav vllm_local backend requires {pkg} {want} but {pkg} is not "
                 f"installed. Install with: pip install -e '.[vllm]'"
             ) from None
-        if not found.startswith(prefix):
+        if not found.startswith(prefixes):
             raise RuntimeError(
-                f"lightnav's vLLM embedding monkeypatch targets {pkg} {prefix}x internals, "
+                f"lightnav's vLLM embedding monkeypatch targets {pkg} {want} internals, "
                 f"but found {pkg}=={found}. This version is untested and the patch WILL likely "
-                f"break (it binds private APIs). Pin {pkg} to the verified version, or set "
+                f"break (it binds private APIs). Pin {pkg} to a verified version, or set "
                 f"LIGHTNAV_SKIP_VERSION_GUARD=1 to override at your own risk."
             )
 
@@ -58,6 +69,29 @@ def apply_vllm_embedding_monkeypatch():
     Must be called before creating the vLLM LLM engine.
     """
     _assert_vllm_version()
+
+    # transformers 4.x cannot read a 5.x tokenizer_config.json: the field
+    # `extra_special_tokens` is a 5.0 rename of `additional_special_tokens`, and
+    # 4.x ends up calling .keys() on the list. The shim only rewrites the kwargs
+    # handed to AutoTokenizer.from_pretrained -- no file is touched. No-op on 5.x.
+    from lightnav.inference.tokenizer_compat import (
+        describe_tokenizer_compat,
+        patch_autotokenizer,
+    )
+
+    if patch_autotokenizer():
+        print(f"[lightnav] {describe_tokenizer_compat()}", flush=True)
+
+    # transformers 4.x cannot read a 5.x config.json either: `rope_parameters` is a
+    # 5.0 rename of `rope_scaling`, and 4.57's rotary embedding does
+    # `config.rope_scaling.get(...)` on None. Same class of breakage, same fix shape.
+    from lightnav.inference.config_compat import (
+        describe_rope_compat,
+        patch_qwen3vl_rotary,
+    )
+
+    if patch_qwen3vl_rotary():
+        print(f"[lightnav] {describe_rope_compat()}", flush=True)
 
     import hashlib
     import types
@@ -191,11 +225,22 @@ def apply_vllm_embedding_monkeypatch():
         image_grid_thw = torch.stack(img) if img else None
         video_grid_thw = torch.stack(vid) if vid else None
 
-        # HF get_rope_index needs self.config + self.get_vision_position_ids (stateless).
+        # HF get_rope_index needs self.config, plus (transformers 5.x only)
+        # self.get_vision_position_ids. 4.57 computes vision positions inline and
+        # has no such method -- binding it unconditionally raises AttributeError.
+        from lightnav.inference.rope_compat import call_get_rope_index
+
         fake = types.SimpleNamespace(config=cfg)
-        fake.get_vision_position_ids = types.MethodType(_HFQwen3VLModel.get_vision_position_ids, fake)
-        position_ids, mrope_delta = _HFQwen3VLModel.get_rope_index(
-            fake, input_ids, mm_token_type_ids, image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw
+        _vision_pos = getattr(_HFQwen3VLModel, "get_vision_position_ids", None)
+        if _vision_pos is not None:
+            fake.get_vision_position_ids = types.MethodType(_vision_pos, fake)
+        position_ids, mrope_delta = call_get_rope_index(
+            _HFQwen3VLModel.get_rope_index,
+            fake,
+            input_ids,
+            mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
         )
         delta = mrope_delta.flatten()[0].item() if torch.is_tensor(mrope_delta) else int(mrope_delta)
         # vllm expects (mrope_positions [3, seq], mrope_position_delta int).
@@ -356,6 +401,12 @@ def load_vllm_engine(config: InferenceConfig, num_frames: int = 64) -> Any:
     instead of an arbitrary large value frees a large slice of GPU memory per
     instance, which is what allows several servers to share one GPU.
     """
+    # Install the transformers-4 tokenizer shim before anything constructs a
+    # tokenizer. Idempotent, and a no-op on transformers 5.x.
+    from lightnav.inference.tokenizer_compat import patch_autotokenizer
+
+    patch_autotokenizer()
+
     if torch.cuda.is_available():
         torch.zeros(1, device="cuda")
 

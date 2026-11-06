@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Standalone inference for trajectory-token vision-language navigation checkpoints (Qwen3-VL based)"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.10,<3.12"
 dependencies = [
     # Core: HF backend + WebSocket server + trajectory-token decode.
     # transformers is pinned exactly: the data processor subclasses Qwen3VLProcessor
@@ -58,7 +58,20 @@ lightnav-render = "lightnav.cli.render:main"
 #   AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 # while the engine is starting, i.e. before any inference is possible. Upgrading
 # quack does not help -- the DSL is what has to be held back.
-vllm = ["vllm==0.19.1", "nvidia-cutlass-dsl==4.5.2"]
+#
+# quack-kernels is pinned too, for the same reason in the other direction: its own
+# cutlass requirement rose over time, so an unpinned resolve now picks a quack that
+# demands a newer DSL than 4.5.2 and the resolve simply fails with
+#   quack-kernels>=0.6.5 depends on nvidia-cutlass-dsl>=4.7
+#   0.6.0/0.6.3/0.6.4 pin /== 4.6.x
+#   0.5.0 is the last release that accepts >=4.5.2.
+# quack is only imported from vllm/vllm_flash_attn/cute/ (the SM90/SM100 CUTLASS DSL
+# attention kernels); the SM8x path uses the prebuilt _vllm_fa2_C.abi3.so SASS, so a
+# quack that merely imports cleanly is sufficient.
+#
+# Jetson Orin (SM 8.7) additionally requires vllm 0.19.0+cu126 from the
+# jetson-ai-lab index instead of this extra -- see docs/JETSON_ORIN.md.
+vllm = ["vllm==0.19.1", "nvidia-cutlass-dsl==4.5.2", "quack-kernels==0.5.0"]
 # FlashAttention-2 for the HF backend (falls back to sdpa when absent).
 flash = ["flash-attn>=2.7"]
 # mp4 / frame-directory decoding for lightnav-predict and lightnav-ws-client, and the

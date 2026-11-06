@@ -196,6 +196,18 @@ def load_hf_model(config: InferenceConfig, task_type: str = "vlnce") -> ModelBun
 
     from lightnav.processing import VLNQwen3VLProcessor
 
+    # transformers 4.x needs two 5.x checkpoint-format fields renamed before any
+    # config/rotary object is built (see the *_compat modules for the details).
+    from lightnav.inference.config_compat import (
+        describe_rope_compat,
+        patch_qwen3vl_rotary,
+    )
+    from lightnav.inference.tokenizer_compat import patch_autotokenizer
+
+    patch_autotokenizer()
+    if patch_qwen3vl_rotary():
+        print(f"[lightnav] {describe_rope_compat()}", flush=True)
+
     if not config.model_path:
         raise ValueError("--model_path is required.")
 
@@ -287,14 +299,24 @@ def _get_position_id(main_func, self, **kwargs):
     transformers 5.8's Qwen3VLModel.get_rope_index calls self.get_vision_position_ids(...),
     but we pass a minimal SimpleNamespace(config=...) as ``self``, which lacks that
     method. get_vision_position_ids uses no instance state, so bind it on demand.
+
+    ``kwargs`` may carry ``mm_token_type_ids``, which only transformers 5.x accepts;
+    :func:`rope_compat.call_get_rope_index` drops it on 4.x (see that module).
     """
     import types
 
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 
+    from lightnav.inference.rope_compat import call_get_rope_index
+
     if not hasattr(self, "get_vision_position_ids") and hasattr(Qwen3VLModel, "get_vision_position_ids"):
         self.get_vision_position_ids = types.MethodType(Qwen3VLModel.get_vision_position_ids, self)
-    position_ids, rope_deltas = main_func(self, **kwargs)
+
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+    input_ids = kwargs.pop("input_ids", None)
+    position_ids, rope_deltas = call_get_rope_index(
+        main_func, self, input_ids, mm_token_type_ids, **kwargs
+    )
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 

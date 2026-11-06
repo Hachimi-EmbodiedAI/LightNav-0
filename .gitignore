@@ -10,6 +10,9 @@ dist/
 # virtual envs
 .venv/
 .venv-*/
+# uv writes a `.gitignore` containing `*` into each venv it creates, but
+# `python -m venv` does not -- keep the versioned names ignored either way.
+.venv[0-9]*/
 
 # runtime state written by scripts/start_servers.sh
 .servers_ready/
