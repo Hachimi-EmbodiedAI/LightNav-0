@@ -14,7 +14,7 @@ This script dumps a fingerprint of the tokenizer + a real prompt encoding. Run i
 in each environment and diff the two JSON files:
 
     # on the 3.11 venv (transformers 5.8)
-    .venv/bin/python scripts/verify_tokenizer_parity.py --out /tmp/tok58.json
+    .venv311/bin/python scripts/verify_tokenizer_parity.py --out /tmp/tok58.json
 
     # on the 3.10 venv (transformers 4.57)
     .venv310/bin/python scripts/verify_tokenizer_parity.py --out /tmp/tok457.json

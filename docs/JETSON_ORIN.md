@@ -405,6 +405,17 @@ python -c "from lightnav.inference.rope_compat import describe_rope_index_compat
    「cp311 整条路线被堵死」，其实只是 PyPI 轮子的问题：jetson 那个
    `cp310` 轮子内部全是 `abi3` 扩展、不引用任何 Python C-API 符号，重打成
    `cp311` 标签后可以独立安装，实测 **1.27 Hz、输出与 3.10 逐 token 一致**。
+
+> **本机 venv 现状（2026-11-06）**：
+>
+> | venv | 体积 | 用途 |
+> |---|---|---|
+> | `.venv310` | 5.5 GB | 推理基线（transformers 4.57 + jetson vLLM cp310）|
+> | `.venv311` | 5.1 GB | 推理新路线（自编译 torch + 重打包 vLLM + transformers 5.8）|
+> | `.venv_ros` | 179 MB | 机器人侧 ROS 2 节点（numpy 1.21.5 + casadi，见 `robot_deploy/docs/RUNTIME.md`）|
+> | ~~`.venv`~~ | ~~8.3 GB~~ | **已删除**：pytorch.org 轮子 + PyPI vLLM 0.19.1，即上面第 1、2 条，
+> 实测 `no kernel image is available`。保留它反而危险 —— `torch.cuda.is_available()`
+> 返回 `True`，看起来健康。 |
    步骤见 [`JETSON_ORIN_POWER.md`](JETSON_ORIN_POWER.md) §1。
 
 > 自编译 torch 的前提（若你要重做）：`TORCH_CUDA_ARCH_LIST=8.7`，且

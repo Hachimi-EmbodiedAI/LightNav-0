@@ -30,14 +30,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # (`cuda.is_available()` is True) but contains only sm_80/sm_90 kernels and dies
 # with "no kernel image is available" on the first launch.
 #
-# So: prefer .venv310, and if VENV is unset fall back to .venv only when no
-# Orin-capable venv exists -- the preflight will then report the real problem.
+# So: prefer .venv310, then .venv311 (self-built sm_87 torch, works the same),
+# and only then .venv -- the preflight will report the real problem if that
+# inherited-upstream venv is the only thing left.
 default_venv() {
-    if [ -x "$REPO_ROOT/.venv310/bin/python" ]; then
-        echo "$REPO_ROOT/.venv310"
-    else
-        echo "$REPO_ROOT/.venv"
-    fi
+    for candidate in .venv310 .venv311; do
+        if [ -x "$REPO_ROOT/$candidate/bin/python" ]; then
+            echo "$REPO_ROOT/$candidate"
+            return
+        fi
+    done
+    echo "$REPO_ROOT/.venv"
 }
 VENV=${VENV:-$(default_venv)}
 
