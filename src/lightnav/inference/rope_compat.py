@@ -21,15 +21,28 @@ vLLM 后端各一处）。这里集中处理，避免调用点各自判断。
 from __future__ import annotations
 
 import inspect
+from functools import lru_cache
 from typing import Any
 
 
-def supports_mm_token_type_ids(func: Any) -> bool:
-    """True if ``func`` (an unbound method) accepts ``mm_token_type_ids``."""
+@lru_cache(maxsize=8)
+def _accepts_mm_token_type_ids(func: Any) -> bool:
+    """Cached probe: does ``func`` accept ``mm_token_type_ids``?
+
+    Caching matters: :func:`call_get_rope_index` sits on the per-step mrope path
+    (``_patched_get_mrope_input_positions`` runs once per inference step), and
+    ``inspect.signature`` costs tens of microseconds each call. The answer can
+    never change within a process, so a small LRU is safe.
+    """
     try:
         return "mm_token_type_ids" in inspect.signature(func).parameters
     except (TypeError, ValueError):  # builtins / C callables
         return False
+
+
+def supports_mm_token_type_ids(func: Any) -> bool:
+    """True if ``func`` (an unbound method) accepts ``mm_token_type_ids``."""
+    return _accepts_mm_token_type_ids(func)
 
 
 def call_get_rope_index(

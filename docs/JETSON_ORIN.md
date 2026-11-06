@@ -8,15 +8,15 @@ Thor 是 SM 11.0，Orin 是 SM 8.7，两者可用轮子的情况**完全不同**
 
 | 组件 | Orin 上唯一可行来源 | 原因 |
 |---|---|---|
-| **功耗模式** | **`MODE_30W`**（`sudo nvpmodel -m 2`） | **MAXN 在加载 9.7 GB 权重时整机断电**，见第 5 节 |
+| **功耗模式** | **`MODE_50W`**（`sudo nvpmodel -m 3`） | **MAXN 在加载 9.7 GB 权重时整机断电**，见第 5 节 |
 | Python | **3.10** | 唯一有 sm_87 kernel 的 vLLM 轮子是 `cp310` |
 | torch | **jetson-ai-lab**（非 pytorch.org，非 PyPI） | pypi/pytorch.org 的 aarch64 轮子只编 `sm_80`/`sm_90` |
 | CUDA 运行库 | **JetPack 原生**（`cuda-cudart-12-6` 等 runtime 包 + `libcudnn9`） | pip 的 `nvidia-*-cu12` 是数据中心构建，**缺 sm_87** |
 | vLLM | **jetson-ai-lab `vllm-0.19.0+cu126`** | PyPI 的 aarch64 轮子 PTX 是 8.8（CUDA 12.9），且无 sm_87 |
 | transformers | **4.57.1** | vllm 0.19.0 元数据钉 `<5`；由 `rope_compat` / `tokenizer_compat` 抹平 API 差异 |
 
-实测结果（`MODE_30W`）：服务首次启动 **150 s**，单步 **776 ms**（ViT 130 + LLM 640），
-端到端 **1.29 Hz**，峰值功耗 **12.5 W**。真机须降速到 `v_max ≈ 0.25 m/s`。
+实测结果（`MODE_50W`）：服务首次启动 **150 s**，单步 **642 ms**（ViT 132 + LLM 523），
+端到端 **1.50–1.56 Hz**，峰值功耗 **25.4 W**。真机须降速到 `v_max ≈ 0.3 m/s`。
 
 ## 为什么 pip 的 CUDA 库在 Orin 上不可用
 
@@ -247,37 +247,45 @@ uv pip install "pillow>=11.0" "pyyaml>=6.0" "websockets>=12.0" "numpy>=2.0" acce
 （SM90/SM100 的 CUTLASS DSL attention kernel）里被 import，SM8x 走的是预编译的
 `_vllm_fa2_C.abi3.so` SASS，所以只要它能 import 成功即可。
 
-### 5. 供电：**MAXN 会硬断电，必须用 30W**
+### 5. 功耗模式：**用 `MODE_50W`**，MAXN 在本机会硬断电
 
 这是 Orin 上最容易误判成软件故障的问题，**先读这一节再启动**。
 
-实测（2026-11-06，AGX Orin 64GB）：
+实测（2026-11-06，AGX Orin 64GB，`--backend vllm_local`）：
 
-| 功耗模式 | GPU 上限 | 加载 9.7 GB 权重 | 峰值功率 | 结果 |
+| 功耗模式 | GPU 上限 | 加载 9.7 GB 权重 | 端到端吞吐 | 峰值功耗 |
 |---|---|---|---|---|
-| `MAXN` (0) | 1300 MHz | ❌ **整机断电重启** | 瞬间尖峰，未落盘 | 无法启动 |
-| `MODE_30W` (2) | 612 MHz | ✅ 成功 | **12.5 W** | 1.29 Hz |
+| `MAXN` (0) | 1300 MHz | ❌ **整机断电重启** | — | — |
+| `MODE_50W` (3) | 816 MHz | ✅ 成功 | **1.50–1.56 Hz** | 25.4 W |
+| `MODE_30W` (2) | 612 MHz | ✅ 成功 | **1.28 Hz** | 12.5 W |
+| `MODE_15W` (1) | 408 MHz | （未实测，预期可用） | — | — |
 
-现象：`lightnav-serve` 打印到 `Using FlashAttention version 2` 之后**几秒内整机
-断电**。不是 kernel panic、不是重启、没有 `pstore` 记录、温度 41 °C。
-
-判别供电问题而非软件问题的三个证据：
-
-1. **逐步加压测试全过**：`DeviceMemoryProfiler`、gloo all-reduce、9.7 GB 分配 +
-   填充 + 真实 MLP forward，在 MAXN 下逐项都能跑完；只有**完整 vLLM 加载**才断电。
-2. **HF 后端直载 8.95 GB 成功**（`scripts/test_hf_load.py`）：顺序加载功耗平稳，
-   vLLM 是分片并发加载 + 立即 CUDA graph capture，瞬时电流峰值高得多。
-3. **30W 模式下峰值只有 12.5 W**，远低于 `curr1_max`（81.9 A @ 12 V）。
-   说明瓶颈是**瞬时电流能力**，不是平均功率预算。
-
-切到 30W：
+**推荐 `MODE_50W`**：比 30W 快 22%（LLM decode 640 → 523 ms），且连续 20 步验证稳定。
 
 ```bash
-sudo nvpmodel -m 2
-nvpmodel -q          # 应显示 MODE_30W
+sudo nvpmodel -m 3     # MODE_50W
+nvpmodel -q            # 确认
 ```
 
-带功耗监控复现（断电后重启，看 `/tmp/power.log` 最后几行就能确认）：
+现象（MAXN）：`lightnav-serve` 进入 vLLM 初始化后**十几秒内整机断电**。不是 kernel
+panic（`panic=0` 会让 panic 挂住而不是重启），没有 `pstore` 记录，温度 41–45 °C。
+
+⚠️ **原因尚未确定。** 早期认为「瞬时电流尖峰触发输入保护」，但带功耗监控后
+抓到的断电前读数是 **2.1–3.8 W、GPU 306 MHz（未升频）**，这个假设已不成立。
+50W（816 MHz）稳定而 MAXN（1300 MHz）必死，说明与**频率档位**相关，而不是简单的
+总功率。剩下的测量盲区是 INA3221 的 `samples=512` 使读数为 512 ms 平均，
+毫秒级尖峰不可见。完整的调查过程、已排除的假设与下一步见
+[**`JETSON_ORIN_POWER.md`**](JETSON_ORIN_POWER.md) §3。
+
+**工程上的做法：用 50W（或 30W）。** 两者都能稳定加载，50W 快 22%。
+
+```bash
+sudo nvpmodel -m 3     # MODE_50W（推荐）
+# sudo nvpmodel -m 2   # MODE_30W（更保守，功耗减半）
+nvpmodel -q            # 确认
+```
+
+排查时带功耗监控（读数落到文件，断电后重启还能看）：
 
 ```bash
 cd /path/to/LightNav-0
@@ -286,14 +294,14 @@ bash scripts/monitor_power.sh /tmp/power.log &   # 每 0.5 s 落盘 VDD_IN/I/P
 tail -5 /tmp/power.log
 ```
 
-**根治办法是换更大功率的 19 V DC 电源（90 W+）**，之后 MAXN 可跑，按 GPU 频率
-翻倍估算约 2–2.4 Hz。USB-C PD 供电最容易触发这个保护。
+`scripts/serve_orin.sh` 在 MAXN 下**只警告不拦截**（3 秒后继续），`MAXN_WARN=0`
+可静默。
 
 ### 6. 启动
 
 ```bash
-# 前置：确认 30W（见上一节）
-nvpmodel -q                      # 必须是 MODE_30W
+# 前置：确认功耗模式（见上一节）
+nvpmodel -q                      # MODE_50W（推荐）或 MODE_30W；MAXN 会断电
 
 cd /path/to/LightNav-0
 MODEL_PATH=$PWD/checkpoints/LightNav-0 TASK=vln bash scripts/serve_orin.sh
@@ -334,21 +342,24 @@ pkill -f "lightnav.serving.ws[_]server"    # 方括号避免匹配到自己的�
 `scripts/serve_orin.sh` 的 preflight 会先检查 torch CUDA 可用性、cuBLAS matmul、
 cutlass `ThrMma`、SM 版本、pip CUDA 库污染，失败即退出并给出修复命令。
 
-## 实测性能（MODE_30W，单会话）
+## 实测性能（单会话）
 
-| 项 | 值 |
-|---|---|
-| 服务启动 | 150 s 首次 / ~70 s （缓存有效时） |
-| 单步延迟中位 | **776 ms** |
-| ├ ViT（视觉塔） | 130 ms |
-| └ LLM decode（5 个 token） | 640 ms |
-| 端到端吞吐 | **1.29 Hz** |
-| 显存占用 | ~11 GB / 61 GB 统一内存 |
+| 项 | `MODE_50W` | `MODE_30W` |
+|---|---|---|
+| 服务启动 | 150 s 首次 / ~70 s（缓存有效时） | 同左 |
+| 单步延迟中位 | **642–666 ms** | 776 ms |
+| ├ ViT（视觉塔） | 129–132 ms | 130 ms |
+| └ LLM decode（5 个 token） | **523–532 ms** | 640 ms |
+| 端到端吞吐 | **1.50–1.56 Hz** | 1.28 Hz |
+| 峰值功耗 | 25.4 W | 12.5 W |
+| 显存占用 | ~11 GB / 61 GB 统一内存 | 同左 |
 
-**对真机部署的含义**：1.29 Hz 意味着每 776 ms 才更新一次目标。`vln_mpc` 的
-控制环是 10 Hz，即每 ~8 个周期换一次参考轨迹。**必须降速**：
-`track_v_max 0.25`（默认 1.5）、`objnav_v_max 0.2`（默认 0.8）、`a_max_v 1.0`。
-若换电源后到 2+ Hz，可放宽到 0.4–0.5 m/s。
+（50W 数据来自连续 20 步两轮测量；30W 为早期基线。）
+
+**对真机部署的含义**：1.5 Hz 意味着每 ~650 ms 更新一次目标。`vln_mpc` 的
+控制环是 10 Hz，即每 ~6 个周期换一次参考轨迹。**仍需降速**：
+`track_v_max 0.3`（默认 1.5）、`objnav_v_max 0.25`（默认 0.8）、`a_max_v 1.0`。
+若能解决 MAXN 断电（或换电源）到 2+ Hz，可放宽到 0.4–0.5 m/s。
 
 ## 与 transformers 版本的关系
 
@@ -370,7 +381,7 @@ python -c "from lightnav.inference.rope_compat import describe_rope_index_compat
 
 ## 硬件前置
 
-- **供电（最重要）**：`nvpmodel -q` 必须是 **MODE_30W**。MAXN 会在加载权重时
+- **供电（最重要）**：`nvpmodel -q` 应为 **MODE_50W**（推荐）或 `MODE_30W`。MAXN 会在加载权重时
   整机断电 —— 机制与诊断见上文「5. 供电」一节。
 - **USB 相机链路**：`lsusb -t` 确认相机枚举在 `5000M`。USB-2 会让相机静默掉到
   10 fps，推理率减半、转弯失稳 —— 这个影响压倒任何模型侧优化。
@@ -379,20 +390,27 @@ python -c "from lightnav.inference.rope_compat import describe_rope_index_compat
 - **无鉴权**：`lightnav-serve` 自身没有认证。板载时绑 `127.0.0.1`，
   跨机访问时限定私有网段。
 
-## 未走通的两条路（避免重试）
+## 未走通的一条路，和一条被误判为「走不通」的路
 
 留档以免重复劳动：
 
-1. **`pytorch.org` 的 `torch-2.10.0+cu126` aarch64 轮子** —— `cu126` 只表示工具链，
+1. ❌ **`pytorch.org` 的 `torch-2.10.0+cu126` aarch64 轮子** —— `cu126` 只表示工具链，
    架构仍是 `sm_80`/`sm_90` 且不含 PTX，Orin 上第一个 CUDA kernel 就
    `no kernel image is available`。已在上面「为什么 pytorch.org 也不行」详述。
-2. **自编译 cp311 torch + PyPI `vllm==0.19.1`** —— 自编译 torch 是可行的
-   （`TORCH_CUDA_ARCH_LIST=8.7`，见 `jetson-pytorch-builder`），且 `USE_DISTRIBUTED=1`
-   必须打开（vLLM 无条件 import `torch.distributed._functional_collectives` →
-   `torch.distributed.distributed_c10d`）。但 **PyPI 的 aarch64 vLLM 轮子 PTX 是
+2. ❌ **cp311 + PyPI 的 `vllm==0.19.1`** —— **PyPI 的 aarch64 vLLM 轮子 PTX 是
    8.8（CUDA 12.9），而 L4T R36.5 驱动只到 12.6（PTX 8.5）**，运行时报
    `CUDA error: the provided PTX was compiled with an unsupported toolchain`。
-   要用 cp311 就得再自编译 vLLM，收益不如直接用 jetson 的 cp310 轮子。
+   这一条只针对 **PyPI** 的轮子。
+3. ✅ **cp311 + jetson 的 vLLM 0.19.0（重打包标签）—— 可行**。原文曾误以为
+   「cp311 整条路线被堵死」，其实只是 PyPI 轮子的问题：jetson 那个
+   `cp310` 轮子内部全是 `abi3` 扩展、不引用任何 Python C-API 符号，重打成
+   `cp311` 标签后可以独立安装，实测 **1.27 Hz、输出与 3.10 逐 token 一致**。
+   步骤见 [`JETSON_ORIN_POWER.md`](JETSON_ORIN_POWER.md) §1。
+
+> 自编译 torch 的前提（若你要重做）：`TORCH_CUDA_ARCH_LIST=8.7`，且
+> **`USE_DISTRIBUTED=1` 必须打开** —— vLLM 无条件 import
+> `torch.distributed._functional_collectives` → `torch.distributed.distributed_c10d`，
+> 少了它 vLLM 连 import 都过不去。
 
 ## 脚本清单
 
@@ -406,6 +424,7 @@ python -c "from lightnav.inference.rope_compat import describe_rope_index_compat
 | `load_engine.py` | 不经 WS 直接建引擎并跑 `--bench N` | 隔离「引擎慢」还是「网络/协议慢」 |
 | `test_hf_load.py` | 用纯 transformers 加载（不经过 vLLM） | **供电诊断的对照组**：它能在 MAXN 下跑完而 vLLM 不能 |
 | `verify_tokenizer_parity.py` | 对比 transformers 4.57 与 5.8 的 tokenizer 输出 | 换 transformers 版本后证明 tokenization 未漂移 |
+| `repackage_vllm_cp311.py` | 把 jetson 的 `cp310` vLLM 树重打成 `cp311` wheel | 需要给 Python 3.11 装原生 sm_87 vLLM（见 `JETSON_ORIN_POWER.md`） |
 
 `serve_orin.sh` 常用旋钮：
 
@@ -419,6 +438,6 @@ bash scripts/serve_orin.sh --stop
 
 两个环境变量用于特殊情况：
 
-- `ALLOW_MAXN=1` —— 电源足够（≥90 W）时允许 MAXN，跳过功耗检查。
+- `MAXN_WARN=0` —— 静默 MAXN 下的断电警告（检查仍然会跑，不再拦截）。
 - `NV_LIBS=1` —— 把 pip 的 `nvidia/*/lib` 前置（**仅调试**，在 Orin 上会拉进
   缺 sm_87 的数据中心库）。

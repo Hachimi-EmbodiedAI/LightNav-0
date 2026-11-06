@@ -278,33 +278,31 @@ fi
 
 
 # --------------------------------------------------------------- power mode --
-# MAXN issues a hard power-off on this board when the 9.7 GB weight load starts:
-# the GPU boosts to 1300 MHz and the instantaneous current spike trips the input
-# protection. There is no kernel log -- the machine simply loses power a few
-# seconds into `Using FlashAttention version 2`. MODE_30W peaks at 12.5 W and
-# works. Measured 2026-11-06; see docs/JETSON_ORIN.md "5. 供电".
+# Observed on this board (2026-11-06): the machine hard-powers-off during the
+# 9.7 GB weight load in MAXN. It is NOT a power-ceiling problem -- a monitor
+# caught the last reading at 2.1 W / 306 MHz -- so the cause is still open
+# (suspect the supply rail itself or a PMIC/driver event). MODE_30W loads the
+# same model reliably and peaks at 12.5 W.
 #
-# Warn only (and allow override) so the script stays usable on properly powered
-# boards, where MAXN is the faster choice.
+# This is a WARNING, not a gate: the operator may have a supply that handles
+# MAXN, or may be chasing this very bug. Set MAXN_WARN=0 to silence it.
 _nvp=$(nvpmodel -q 2>/dev/null | tr '\n' ' ')
-case "$_nvp" in
-    *MAXN*)
-        if [ "${ALLOW_MAXN:-0}" = "1" ]; then
-            echo "[serve_orin] WARN: MAXN with ALLOW_MAXN=1 -- if the machine powers off" >&2
-            echo "[serve_orin]       during weight load, this is why (no kernel log)." >&2
-        else
-            echo "[serve_orin] ERROR: power mode is MAXN." >&2
-            echo "[serve_orin]        On AGX Orin MAXN hard-powers-off while the 9.7 GB of" >&2
-            echo "[serve_orin]        weights load (instantaneous current spike, no kernel log)." >&2
-            echo "[serve_orin]        Fix:   sudo nvpmodel -m 2      # MODE_30W, peaks 12.5 W" >&2
-            echo "[serve_orin]        Or on a >=90 W 19 V supply:  ALLOW_MAXN=1" >&2
-            exit 1
-        fi
-        ;;
-    *"MODE 15W"*)
-        echo "[serve_orin] WARN: MODE_15W -- will work but roughly half the GPU clock of 30W." >&2
-        ;;
-esac
+if [ "${MAXN_WARN:-1}" = "1" ]; then
+    case "$_nvp" in
+        *MAXN*)
+            echo "[serve_orin] WARN: power mode is MAXN." >&2
+            echo "[serve_orin]       On this board MAXN has hard-powered-off during weight load" >&2
+            echo "[serve_orin]       (no kernel log; last power reading was ~2 W, so it is not a" >&2
+            echo "[serve_orin]       wattage ceiling). Continuing anyway -- Ctrl-C now if unwanted." >&2
+            echo "[serve_orin]       Known-good alternative:  sudo nvpmodel -m 2   # MODE_30W" >&2
+            echo "[serve_orin]       Silence this notice with MAXN_WARN=0." >&2
+            sleep 3
+            ;;
+        *"MODE 15W"*)
+            echo "[serve_orin] WARN: MODE_15W -- will work, at roughly half the 30W GPU clock." >&2
+            ;;
+    esac
+fi
 
 preflight
 
