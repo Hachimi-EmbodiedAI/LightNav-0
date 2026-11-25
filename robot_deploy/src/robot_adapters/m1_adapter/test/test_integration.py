@@ -1,13 +1,12 @@
-"""End-to-end tests for m1_adapter against a FAKE robot_control.
+"""End-to-end tests for m1_adapter against a FAKE m1_robot_driver.
 
-Real ROS 2 messages, real DDS, real timers -- but the robot_control node is
+Real ROS 2 messages, real DDS, real timers -- but the chassis driver is
 replaced by a small stub that publishes RobotStatus and records the services and
 twists it receives.  Nothing here can move a robot.
 
 Run with the ROS venv:
 
-    source /opt/ros/humble/setup.bash
-    source /home/jetson/Public/hachimi_ws/install/setup.bash
+    source /home/jetson/Public/LightNav-0/robot_deploy/scripts/m1_env.sh
     .venv_ros/bin/python -m pytest test/test_integration.py -q
 
 Skipped automatically when robot_control's messages are not importable, so this
@@ -32,16 +31,19 @@ from m1_adapter.adapter_node import M1AdapterNode  # noqa: E402
 
 
 class FakeRobotControl:
-    """Minimal stand-in for robot_control: state out, services in, cmd_vel in."""
+    """Minimal stand-in for m1_robot_driver: state out, services in, cmd_vel in."""
 
     def __init__(self, node):
         self.node = node
         self.twists = []
         self.posture_calls = []
         self.estop_calls = []
+        self.switch_remote_calls = 0
         self.take_control_calls = 0
         self.posture = "walk"
+        self.machine_status = "remote"
         self.estop = False
+        self.hw_estop = False
         self.take_control_ok = True
         self._lock = threading.Lock()
 
@@ -52,6 +54,9 @@ class FakeRobotControl:
             node.create_service(
                 Trigger, f"/robot_control/{name}", self._make_posture_srv(name)
             )
+        node.create_service(
+            Trigger, "/robot_control/switch_remote", self._on_switch_remote
+        )
         node.create_service(
             SetBool, "/robot_control/soft_emergency_stop", self._on_estop
         )
@@ -72,6 +77,14 @@ class FakeRobotControl:
 
         return handler
 
+    def _on_switch_remote(self, _request, response):
+        with self._lock:
+            self.switch_remote_calls += 1
+            self.machine_status = "remote"
+        response.success = True
+        response.message = "switched to remote"
+        return response
+
     def _on_estop(self, request, response):
         with self._lock:
             self.estop = bool(request.data)
@@ -89,19 +102,27 @@ class FakeRobotControl:
         return response
 
     # -- test helpers ------------------------------------------------------
-    def publish_status(self, posture=None, estop=None) -> None:
-        if posture is not None:
-            with self._lock:
-                self.posture = posture
-        if estop is not None:
-            with self._lock:
-                self.estop = estop
-        msg = RobotStatus()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
+    def publish_status(
+        self, posture=None, estop=None, hw_estop=None, machine_status=None
+    ) -> None:
         with self._lock:
+            if posture is not None:
+                self.posture = posture
+            if estop is not None:
+                self.estop = estop
+            if hw_estop is not None:
+                self.hw_estop = hw_estop
+            if machine_status is not None:
+                self.machine_status = machine_status
+            msg = RobotStatus()
+            msg.header.stamp = self.node.get_clock().now().to_msg()
             msg.motion_status_name = self.posture
-            msg.software_emergency_status = 1 if self.estop else 0
-            msg.software_emergency_status_name = "engaged" if self.estop else "disengaged"
+            msg.machine_status_name = self.machine_status
+            # SDK 0.2.3 EmergencyStatus: 1=recover (safe), 2=stop (engaged)
+            msg.software_emergency_status = 2 if self.estop else 1
+            msg.software_emergency_status_name = "stop" if self.estop else "recover"
+            msg.hardware_emergency_status = 2 if self.hw_estop else 1
+            msg.hardware_emergency_status_name = "stop" if self.hw_estop else "recover"
             msg.control_source_name = "sdk"
         self.state_pub.publish(msg)
 
@@ -116,20 +137,8 @@ class FakeRobotControl:
             self.estop_calls.clear()
 
 
-def spin_until(predicate, executor, timeout=3.0):
-    """Spin both nodes until predicate() is true or the timeout expires."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        executor.spin_once(timeout_sec=0.02)
-        if predicate():
-            return True
-    return False
-
-
 @pytest.fixture
 def rig():
-    # MultiThreadedExecutor, matching main(): the adapter's posture/e-stop
-    # handlers block on a service future and need another thread to complete it.
     from rclpy.executors import MultiThreadedExecutor
 
     rclpy.init()
@@ -144,7 +153,6 @@ def rig():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     try:
-        # Let discovery settle before any test asserts on message flow.
         time.sleep(0.4)
         yield adapter, fake, executor
     finally:
@@ -156,16 +164,16 @@ def rig():
             rclpy.shutdown()
 
 
-def drive(adapter, fake, executor, *, command, posture, seconds=0.4):
-    """Publish one command in a given posture and collect what came out."""
-    fake.publish_status(posture=posture)
+def drive(
+    adapter, fake, executor, *, command, posture, machine_status="remote", seconds=0.4
+):
+    """Publish one command in a given posture/machine_status and collect output."""
+    fake.publish_status(posture=posture, machine_status=machine_status)
     adapter._set_source("auto")
     msg = TwistStamped()
     msg.twist.linear.x = command[0]
     msg.twist.angular.z = command[1]
 
-    # The adapter has a 350 ms input watchdog, so re-send while we wait.
-    # The executor spins on its own thread; we only need to sleep here.
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         adapter._on_auto_command(msg)
@@ -190,6 +198,21 @@ def test_no_command_while_lying_down(rig):
     )
 
 
+def test_no_command_when_machine_status_is_idle(rig):
+    adapter, fake, executor = rig
+    twists = drive(
+        adapter,
+        fake,
+        executor,
+        command=(0.25, 0.0),
+        posture="walk",
+        machine_status="idle",
+    )
+    assert all(abs(t[0]) < 1e-9 for t in twists), (
+        f"idle machine_status must never move, got {twists[:5]}"
+    )
+
+
 def test_no_command_while_estopped(rig):
     adapter, fake, executor = rig
     fake.publish_status(posture="walk", estop=True)
@@ -203,9 +226,23 @@ def test_no_command_while_estopped(rig):
     assert all(abs(t[0]) < 1e-9 for t in twists), f"e-stop must hold zero, got {twists[:5]}"
 
 
+def test_no_command_while_hardware_estopped(rig):
+    adapter, fake, executor = rig
+    fake.publish_status(posture="walk", hw_estop=True)
+    adapter._set_source("auto")
+    msg = TwistStamped()
+    msg.twist.linear.x = 0.3
+    for _ in range(10):
+        adapter._on_auto_command(msg)
+        time.sleep(0.05)
+    twists, _, _ = fake.snapshot()
+    assert all(abs(t[0]) < 1e-9 for t in twists), (
+        f"hardware e-stop must hold zero, got {twists[:5]}"
+    )
+
+
 def test_unknown_posture_holds_zero(rig):
     adapter, fake, executor = rig
-    # Never publish any status at all.
     adapter._set_source("auto")
     msg = TwistStamped()
     msg.twist.linear.x = 0.3
@@ -236,6 +273,14 @@ def test_posture_service_maps_to_vendor_service(rig):
     assert response.success, response.message
     assert "lie_down" in calls, f"sit should call lie_down, got {calls}"
     assert all(abs(t[0]) < 1e-9 for t in twists), "posture change must zero velocity"
+
+
+def test_switch_remote_service_forwards_to_driver(rig):
+    adapter, fake, executor = rig
+    response = Trigger.Response()
+    adapter._switch_remote(Trigger.Request(), response)
+    assert response.success, response.message
+    assert fake.switch_remote_calls == 1
 
 
 def test_walk_and_stand_both_map_to_stand_up(rig):
@@ -278,4 +323,6 @@ def test_clamping_applies_when_configured(rig):
     twists = drive(adapter, fake, executor, command=(5.0, 0.0), posture="walk")
     nonzero = [t for t in twists if abs(t[0]) > 1e-6]
     assert nonzero, "clamping must not silence the command"
-    assert abs(nonzero[-1][0] - 0.3) < 1e-6, f"expected clamp to 0.3, got {nonzero[-1][0]}"
+    assert abs(nonzero[-1][0] - 0.3) < 1e-6, (
+        f"expected clamp to 0.3, got {nonzero[-1][0]}"
+    )

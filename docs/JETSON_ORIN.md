@@ -1,5 +1,7 @@
 # 在 NVIDIA Jetson AGX Orin 上板载部署 LightNav-0
 
+> 铜锤 M1 阶段交接与日常运维入口：[复现现状与踩坑说明](M1_DEPLOY_STATUS.md) ｜ [常用运维命令速查](M1_OPS_CHEATSHEET.md) ｜ [ZSM 集成与后续规划](M1_ROADMAP.md)
+
 本文记录在 **AGX Orin (SM 8.7, L4T R36.5 / JetPack 6.2, CUDA 12.6)** 上直接跑
 `lightnav-serve` 的可行路径与实测踩坑。与 `JETSON_THOR.md` 是互补关系：
 Thor 是 SM 11.0，Orin 是 SM 8.7，两者可用轮子的情况**完全不同**。

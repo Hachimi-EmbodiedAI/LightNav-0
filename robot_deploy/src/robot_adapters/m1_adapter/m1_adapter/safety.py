@@ -6,15 +6,14 @@ import rclpy.  ``test/test_safety.py`` exercises all of it.
 
 WHY THIS DIFFERS FROM ``tron_adapter/safety.py``
     The TRON adapter gates on one string: its vendor status must be ``"WALK"``.
-    The M1 needs more, because the Genisom SDK refuses or silently drops
-    velocity commands in several postures, and because the robot has its own
-    software emergency stop that outranks anything this node wants to do.
+    The M1 (SDK 0.2.3 / ``m1_robot_driver``) enforces several independent gates,
+    all of which must pass:
 
-    Concretely, three independent gates, all of which must pass:
-
-      1. SOURCE + WATCHDOG   -- whose command is it, and is it fresh?
-      2. POSTURE             -- can this posture move at all?
-      3. SOFT E-STOP         -- has the operator braked the robot?
+      1. HARDWARE / SOFT E-STOP -- operator brakes outrank everything.
+      2. STATUS FRESHNESS       -- stale or missing status never permits motion.
+      3. MACHINE STATUS         -- SDK 0.2.3 requires ``remote`` mode.
+      4. POSTURE                -- only documented movable postures accept Move.
+      5. SOURCE + WATCHDOG      -- whose command is it, and is it fresh?
 
     Any one of them failing yields zero velocity.  They are kept separate
     because they fail for different reasons and the diagnostics should say
@@ -29,21 +28,17 @@ from typing import Optional
 Twist2D = tuple[float, float]
 
 # ---------------------------------------------------------------------------
-# posture gate
+# posture & machine-status gates
 # ---------------------------------------------------------------------------
 # From genisom_robot_sdk/docs/zh/sdk_state_zh.md, the 移动能力 column: these are
 # the postures in which Move()/MoveVelocity() is accepted.  Everything else
 # (lie_down 卧倒, crawl 匍匐, locked 锁定, balance_stand 平衡站立) either ignores
 # a velocity command or, worse, silently transitions the robot.
 #
-# Names are LOWERCASE snake_case because that is what robot_control publishes in
-# RobotStatus.motion_status_name.  The Genisom SDK's own MotionStatus enum is
+# Names are LOWERCASE snake_case because that is what m1_robot_driver publishes
+# in RobotStatus.motion_status_name.  The Genisom SDK's own MotionStatus enum is
 # UPPERCASE (WALK, STAIR, ...); normalise_posture() accepts either spelling so
 # this keeps working if we ever read the SDK directly.
-#
-# Verified on hardware by hachimi_ws (M1, SN 04A016610100737, system 0.3.3):
-# robot_control emits lowercase, and a dog resting in crawl_walk reported
-# "当前姿态未知" until crawl_walk was included here.
 MOVABLE_POSTURES = frozenset(
     {
         "walk",         # also what StandUp reports once it completes
@@ -63,8 +58,51 @@ MOVABLE_POSTURES = frozenset(
 RESTING_POSTURES = frozenset({"lie_down", "crawl", "locked", "balance_stand"})
 
 # Empty/None means "we have not received state yet" -- never allow motion then.
-# hachimi_ws learned this the hard way: it is not the same as "not movable".
 UNKNOWN_POSTURE = ""
+
+# SDK 0.2.3 m1_robot_driver only accepts motion commands when machine_status is
+# `remote`.  Everything else (`idle`, `charging`, `unknown`, empty) holds zero.
+MOVABLE_MACHINE_STATUSES = frozenset({"remote"})
+
+# SDK 0.2.3 EmergencyStatus enum: 0=UNKNOWN, 1=RECOVER (safe), 2=STOP (engaged).
+ESTOP_RECOVERED_NAMES = frozenset(
+    {
+        "recover",
+        "emergency_status_recover",
+        "disengaged",
+        "released",
+        "normal",
+        "ok",
+        "off",
+    }
+)
+ESTOP_ENGAGED_NAMES = frozenset(
+    {
+        "stop",
+        "emergency_status_stop",
+        "engaged",
+        "triggered",
+        "active",
+        "on",
+    }
+)
+
+
+def is_estop_engaged(status_code: int, status_name: Optional[str]) -> bool:
+    """Interpret RobotStatus software/hardware emergency fields (fail-closed).
+
+    In Genisom SDK 0.2.3, ``1`` is ``EMERGENCY_STATUS_RECOVER`` (``"recover"``,
+    safe/released), ``2`` is ``EMERGENCY_STATUS_STOP`` (``"stop"``, engaged),
+    and ``0`` is unknown.  Any unknown or ambiguous state fails closed (True).
+    """
+    name = normalise_posture(status_name)
+    if name in ESTOP_RECOVERED_NAMES:
+        return False
+    if name in ESTOP_ENGAGED_NAMES:
+        return True
+    if name:
+        return True
+    return int(status_code) != 1
 
 
 def normalise_posture(name: Optional[str]) -> str:
@@ -81,13 +119,17 @@ def normalise_posture(name: Optional[str]) -> str:
     return value.lower()
 
 
+def normalise_machine_status(name: Optional[str]) -> str:
+    """Normalise ``RobotStatus.machine_status_name`` to lowercase token."""
+    return normalise_posture(name)
+
+
 def posture_can_move(name: Optional[str]) -> bool:
     """Does the current posture accept velocity commands?
 
     Deliberately accepts BOTH ``crawl_walk`` and ``crawlwalk``: the SDK docs use
     snake_case, the enum uses CamelCase, and normalise_posture() lowercases
-    without inserting underscores.  Missing this cost real debugging time in
-    hachimi_ws.
+    without inserting underscores.
     """
     value = normalise_posture(name)
     if not value:
@@ -96,6 +138,12 @@ def posture_can_move(name: Optional[str]) -> bool:
         return True
     # camel-case enum spelling that lost its underscore
     return value in {p.replace("_", "") for p in MOVABLE_POSTURES}
+
+
+def machine_status_can_move(name: Optional[str]) -> bool:
+    """Does the current machine state accept velocity commands (SDK 0.2.3)?"""
+    value = normalise_machine_status(name)
+    return bool(value) and value in MOVABLE_MACHINE_STATUSES
 
 
 # ---------------------------------------------------------------------------
@@ -117,24 +165,28 @@ def select_command(
     watchdog_s: float,
     max_linear: float = 0.0,
     max_angular: float = 0.0,
+    hardware_estop_engaged: bool = False,
+    machine_status: Optional[str] = "remote",
+    status_stale: bool = False,
 ) -> Optional[Twist2D]:
     """Return the safe active command, or None when output must stop.
 
     Gate order matters for diagnostics and for safety:
 
-      * soft e-stop is checked FIRST.  It is the operator's brake and must not
-        be defeatable by a posture that happens to look movable, or by a fresh
-        command arriving at the same instant.
-      * posture next.  A fresh command in a non-movable posture is not a
-        reason to move, it is a reason to stop.
+      * hardware & software e-stops FIRST.
+      * status freshness next (stale telemetry must fail closed).
+      * machine_status == 'remote' next (SDK 0.2.3 contract).
+      * posture next.
       * source/watchdog last, because that is the normal running path.
 
-    ``max_linear``/``max_angular`` of 0 disable clamping (kept 0 by default so
-    the pure tests stay about gating, not about limits).  When set, they clamp
-    per-axis and preserve sign -- clamp, do not reject, so the operator gets a
-    predictable command rather than a silent no-op.
+    ``max_linear``/``max_angular`` of 0 disable clamping.  When set, they clamp
+    per-axis and preserve sign.
     """
-    if estop_engaged:
+    if hardware_estop_engaged or estop_engaged:
+        return None
+    if status_stale:
+        return None
+    if not machine_status_can_move(machine_status):
         return None
     if not posture_can_move(posture):
         return None
@@ -163,15 +215,24 @@ def stop_reason(
     estop_engaged: bool,
     last_status_age_s: float,
     status_timeout_s: float,
+    hardware_estop_engaged: bool = False,
+    machine_status: Optional[str] = "remote",
 ) -> Optional[str]:
     """Human-readable reason the robot is being held at zero, or None.
 
     Only used for diagnostics/logging; it never decides anything.
     """
+    if hardware_estop_engaged:
+        return "hardware e-stop engaged"
     if estop_engaged:
         return "software e-stop engaged"
     if last_status_age_s > status_timeout_s:
         return "robot_control/state is stale"
+    mval = normalise_machine_status(machine_status)
+    if not mval:
+        return "machine status unknown (no state received yet)"
+    if not machine_status_can_move(mval):
+        return f"machine status {mval!r} is not 'remote'"
     value = normalise_posture(posture)
     if not value:
         return "posture unknown (no state received yet)"

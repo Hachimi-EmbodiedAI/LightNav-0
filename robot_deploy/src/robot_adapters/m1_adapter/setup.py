@@ -17,5 +17,10 @@ setup(
     description="Genisom M1 adapter for the generic robot ROS interface.",
     license="Apache-2.0",
     tests_require=["pytest"],
-    entry_points={"console_scripts": ["m1_adapter = m1_adapter.adapter_node:main"]},
+    entry_points={
+        "console_scripts": [
+            "m1_adapter = m1_adapter.adapter_node:main",
+            "m1_rtsp_camera = m1_adapter.rtsp_camera_node:main",
+        ]
+    },
 )

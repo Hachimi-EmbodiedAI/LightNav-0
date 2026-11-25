@@ -84,6 +84,7 @@ Services:
 | `robot/sit` | `Trigger` | `/robot_control/lie_down` |
 | `robot/crawl` | `Trigger` | `/robot_control/crawl` |
 | `robot/stair` | `Trigger` | `/robot_control/stair` |
+| `robot/switch_remote` | `Trigger` | `/robot_control/switch_remote` |
 | `robot/emergency` | `SetBool` | `/robot_control/soft_emergency_stop` |
 
 ## Parameters
@@ -92,10 +93,12 @@ Services:
 |---|---|---|
 | `control_rate_hz` | `20.0` | `/cmd_vel` publish rate |
 | `input_watchdog_s` | `0.35` | max age of an MPC/web command before zeroing |
-| `state_timeout_s` | `1.0` | max age of `RobotStatus` before zeroing |
+| `state_timeout_s` | `1.0` | max age of `RobotStatus` before zeroing (fail-closed) |
 | `zero_frames` | `5` | explicit zero frames after a source change |
 | `auto_take_control` | `true` | claim SDK control on startup |
 | `take_control_retry_s` | `5.0` | retry interval while refused |
+| `posture_timeout_s` | `10.0` | timeout waiting for posture / `switch_remote` completion |
+| `estop_timeout_s` | `5.0` | timeout waiting for `soft_emergency_stop` response |
 | `max_linear` | `0.0` | clamp, m/s; **0 disables** |
 | `max_angular` | `0.0` | clamp, rad/s; **0 disables** |
 | `cmd_vel_topic` | `/cmd_vel` | output topic |
@@ -114,9 +117,9 @@ watchdog expires *before* `robot_control`'s own `command_timeout_ms: 300`.
 - **No camera.** The vendor stack publishes it. See below for why the transport
   must be `compressed`.
 
-## Camera: use `compressed`, not `raw`
+## Camera: use `compressed`, and include `/compressed` in `image_topic`
 
-Two independent reasons, either one is sufficient:
+Two independent reasons to use `compressed`:
 
 1. `vln_client`'s `raw` path rejects anything that is not `rgb8`:
    ```python
@@ -129,47 +132,62 @@ Two independent reasons, either one is sufficient:
 2. `raw` pulls in `cv_bridge`, which breaks under numpy 2.x
    (`_ARRAY_API not found`, `KeyError: 16`).
 
-`compressed` decodes via `cv2.imdecode` and avoids both.
+`compressed` decodes via `cv2.imdecode` and avoids both. Note that both
+`vln_client` and `vln_web` subscribe directly to `image_topic` with
+`sensor_msgs/CompressedImage` — they do **not** append `/compressed`
+automatically:
 
 ```yaml
-image_topic: /camera/front/image_raw       # no /compressed suffix
-image_transport: compressed                # image_transport appends the suffix
+image_topic: /camera/front/image_raw/compressed
+image_transport: compressed
 ```
 
-## Running
+For standalone operation independent of `zsm_console`, `m1_adapter` also ships
+`m1_rtsp_camera`, which pulls the M1 front camera RTSP stream
+(`rtsp://192.168.168.168:8554/front`) and publishes JPEG `CompressedImage` on
+`/camera/front/image_raw/compressed` (`BEST_EFFORT` sensor QoS). `m1.launch.py`
+enables it by default (`start_rtsp_camera:=true`).
+
+## Running (standalone, SDK 0.2.3 `m1_robot_driver`)
 
 Prerequisites, in this order:
 
 ```bash
-# 1. vendor stack (separate terminals / services, NOT launched from here)
-ros2 launch robot_control robot_control.launch.py     # /cmd_vel, /robot_control/*
-# 2. camera (vendor)                                   # /camera/front/image_raw/compressed
-# 3. inference server
+# 1. Active chassis driver from hachimi_ws (SDK 0.2.3; old robot_control binary is deprecated)
+source /home/jetson/Public/hachimi_ws/scripts/m1_driver_env.sh
+ros2 launch m1_robot_driver robot_control.launch.py
+
+# 2. Inference server (separate terminal)
+cd /home/jetson/Public/LightNav-0
 MODEL_PATH=$PWD/checkpoints/LightNav-0 TASK=vln bash scripts/serve_orin.sh
 ```
 
-Then the stack — **with the ROS venv**, because `rclpy` is a cp310 C extension
-and `.venv311` cannot import it:
+Build `robot_deploy` once with `.venv_ros` (keeps `hachimi_ws` untouched):
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/jetson/Public/hachimi_ws/install/setup.bash   # robot_control messages
-source install/setup.bash
-export PATH=/home/jetson/Public/LightNav-0/.venv_ros/bin:$PATH
+bash /home/jetson/Public/LightNav-0/robot_deploy/scripts/build_ros.sh
+```
 
+Then launch the VLN stack (overlays cleanly on `hachimi_ws/install_m1_driver`):
+
+```bash
+source /home/jetson/Public/LightNav-0/robot_deploy/scripts/m1_env.sh
 ros2 launch vln_bringup m1.launch.py
 ```
 
 Verify before enabling motion:
 
 ```bash
-ros2 topic echo /robot_control/state --once     # motion_status_name must be 'walk'
+ros2 topic echo /robot_control/state --once     # machine_status_name='remote', motion_status_name='walk'
 ros2 topic echo /cmd_vel                        # zeros until a source is enabled
-ros2 topic echo /diagnostics --once             # sdk_control_acquired: True
+ros2 topic echo /diagnostics --once             # sdk_control_acquired: True, remote_ready: True
+# If machine_status_name is 'idle' and the site is clear:
+# ros2 service call /robot/switch_remote std_srvs/srv/Trigger "{}"
 ros2 service call /control/set_auto std_srvs/srv/SetBool "{data: true}"
 ```
 
-`sdk_control_acquired: False` means the phone APP holds control — close it.
+`sdk_control_acquired: False` means the phone APP (or another SDK client) holds
+control — close it first.
 
 ## Tests
 

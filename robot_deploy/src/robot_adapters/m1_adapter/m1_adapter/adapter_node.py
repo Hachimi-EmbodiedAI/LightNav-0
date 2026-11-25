@@ -1,38 +1,32 @@
-"""Bridge the generic LightNav robot interface to the Genisom M1 / robot_control.
+"""Bridge the generic LightNav robot interface to Genisom M1 / m1_robot_driver.
 
 WHAT THIS NODE IS FOR
     ``vln_mpc`` publishes ``TwistStamped`` on ``mpc/cmd_vel``.  The M1's
-    ``robot_control`` node subscribes to plain ``geometry_msgs/Twist`` on
-    ``/cmd_vel``.  So *something* has to sit between them.  This adapter is that
-    something, and it deliberately does more than rename a type, because the M1
-    has three constraints the generic stack knows nothing about:
+    ``m1_robot_driver`` (SDK 0.2.3, interfaces under ``/robot_control/*``)
+    subscribes to plain ``geometry_msgs/Twist`` on ``/cmd_vel``.  This adapter
+    bridges the types and enforces the M1-specific safety gates:
 
-      1. POSTURE.  The Genisom SDK only accepts Move() in walk/stair/crawl_walk/
-         climb/gait/slim/sk_walk/sand.  In lie_down / crawl / locked a velocity
-         command is ignored or silently changes posture.  We refuse up front.
-      2. SOFT E-STOP.  The robot has its own software emergency stop, exposed as
-         ``/robot_control/soft_emergency_stop`` (std_srvs/SetBool).  While it is
-         engaged every velocity command must be zero, regardless of source.
-      3. CONTROL OWNERSHIP.  The SDK grants control to one client at a time and
+      1. HARDWARE & SOFTWARE E-STOP.  Either e-stop active forces zero velocity.
+      2. STATUS FRESHNESS.  Stale or missing ``/robot_control/state`` fails closed.
+      3. MACHINE STATUS.  SDK 0.2.3 requires ``machine_status == 'remote'``.
+      4. POSTURE.  Only documented movable postures accept ``MoveVelocity()``.
+      5. CONTROL OWNERSHIP.  The SDK grants control to one client at a time and
          an attached phone APP always wins -- ``TakeControl()`` will fail while
-         the APP is connected.  We call it on startup and report loudly if it
-         does not succeed, because otherwise every command silently does nothing.
+         the APP is connected.  When ``auto_take_control`` is enabled we claim
+         ownership on startup and retry loudly when refused.
 
 WHAT IT DELIBERATELY DOES NOT DO
-    * It does not publish odometry.  ``robot_control`` already publishes
+    * It does not publish odometry.  ``m1_robot_driver`` already publishes
       ``/robot_control/odometry`` (nav_msgs/Odometry, odom frame); remap it
-      straight into ``vln_mpc``'s ``odom`` topic.  Re-publishing would add
-      latency and a second source of truth.
-    * It does not publish TF.  Same reason: robot_control owns odom->base_link.
-    * It does not touch posture service semantics.  ``stand``/``walk`` both map
-      to ``stand_up`` because that is what the SDK exposes; ``sit`` maps to
-      ``lie_down``.  ``crawl``/``stair``/``locked`` are exposed as-is.
+      straight into ``vln_mpc`` and ``vln_web``.
+    * It does not publish TF.
+    * It does not launch ``m1_robot_driver``.
 
 INTERFACE (mirrors tron_adapter so vln_bringup launches stay interchangeable)
     subscribes  web/cmd_vel        TwistStamped   manual (web UI sticks/WASD)
                 mpc/cmd_vel        TwistStamped   automatic (MPC)
-                robot/state        RobotStatus    posture + e-stop + control src
-    publishes   /cmd_vel           Twist          -> robot_control
+                /robot_control/state RobotStatus  posture + e-stops + machine mode
+    publishes   /cmd_vel           Twist          -> m1_robot_driver
                 cmd_vel_sent       TwistStamped   what we actually forwarded
                 control/source     String         disabled | manual | auto
                 robot/events       String         human-readable transitions
@@ -45,18 +39,13 @@ INTERFACE (mirrors tron_adapter so vln_bringup launches stay interchangeable)
                 robot/sit          Trigger        -> lie_down
                 robot/crawl        Trigger        -> crawl
                 robot/stair        Trigger        -> stair
+                robot/switch_remote Trigger       -> switch_remote
                 robot/emergency    SetBool        -> soft_emergency_stop
-
-TIMING
-    ``robot_control`` has ``command_timeout_ms: 300``, so if this process dies
-    the dog stops by itself within 300 ms.  Our own watchdog (default 350 ms on
-    the INPUT side, i.e. how stale an MPC/web command may be) is therefore a
-    second line of defence, not the only one.  The output publish rate is 20 Hz
-    to match what robot_control expects to see.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Optional
@@ -69,16 +58,24 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_control.msg import RobotStatus
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 
-from .safety import normalise_posture, posture_can_move, select_command, stop_reason
+from .safety import (
+    is_estop_engaged,
+    machine_status_can_move,
+    normalise_machine_status,
+    normalise_posture,
+    posture_can_move,
+    select_command,
+    stop_reason,
+)
 
 VALID_SOURCES = {"disabled", "manual", "auto"}
 
-# Which robot_control service implements each requested posture.
-#   stand / walk -> stand_up : StandUp() reports WALK when it completes, so
-#                              "walk" is not a separate service on this robot.
+# Which /robot_control service implements each requested posture.
+#   stand / walk -> stand_up : StandUp() reports WALK when it completes.
 #   sit          -> lie_down : the SDK has no "sit"; 卧倒 is the resting pose.
 POSTURE_SERVICES = {
     "stand": "stand_up",
@@ -101,10 +98,13 @@ class M1AdapterNode(Node):
         self.declare_parameter("zero_frames", 5)
         self.declare_parameter("auto_take_control", True)
         self.declare_parameter("take_control_retry_s", 5.0)
+        self.declare_parameter("posture_timeout_s", 10.0)
+        self.declare_parameter("estop_timeout_s", 5.0)
         self.declare_parameter("max_linear", 0.0)
         self.declare_parameter("max_angular", 0.0)
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("state_topic", "/robot_control/state")
+        self.declare_parameter("battery_topic", "/robot_control/battery1")
 
         self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.input_watchdog_s = float(self.get_parameter("input_watchdog_s").value)
@@ -114,16 +114,21 @@ class M1AdapterNode(Node):
         self.take_control_retry_s = float(
             self.get_parameter("take_control_retry_s").value
         )
+        self.posture_timeout_s = float(self.get_parameter("posture_timeout_s").value)
+        self.estop_timeout_s = float(self.get_parameter("estop_timeout_s").value)
         self.max_linear = float(self.get_parameter("max_linear").value)
         self.max_angular = float(self.get_parameter("max_angular").value)
         self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
         self.state_topic = str(self.get_parameter("state_topic").value)
+        self.battery_topic = str(self.get_parameter("battery_topic").value)
 
         if (
             self.control_rate_hz <= 0.0
             or self.input_watchdog_s <= 0.0
             or self.state_timeout_s <= 0.0
             or self.final_zero_frames < 0
+            or self.posture_timeout_s <= 0.0
+            or self.estop_timeout_s <= 0.0
             or self.max_linear < 0.0
             or self.max_angular < 0.0
         ):
@@ -147,20 +152,18 @@ class M1AdapterNode(Node):
         self.create_subscription(
             TwistStamped, "mpc/cmd_vel", self._on_auto_command, 10
         )
-        # robot_control publishes /robot_control/state with RELIABLE; match it or
-        # we silently get nothing (this exact mismatch wasted time in hachimi_ws).
+        # m1_robot_driver publishes /robot_control/state with RELIABLE; match it.
         self.create_subscription(
             RobotStatus, self.state_topic, self._on_robot_status, 10
         )
+        self.create_subscription(
+            BatteryState, self.battery_topic, self._on_battery, 10
+        )
 
         # ---- services ----------------------------------------------------
-        # Posture and e-stop handlers block while they wait for robot_control's
-        # reply.  That is only safe in a ReentrantCallbackGroup: in the default
-        # MutuallyExclusive group the service client's future needs the very
-        # executor thread we are sleeping on, and the call times out every time.
-        # (With the real robot_control in another process it happens to work,
-        # but a co-located stub -- our tests, or a future merged node --
-        # deadlocks.  Reentrant + MultiThreadedExecutor is correct either way.)
+        # Posture, mode and e-stop handlers block while waiting for the driver's
+        # reply.  Pair ReentrantCallbackGroup with MultiThreadedExecutor so the
+        # client's future can be serviced on another thread.
         self._service_group = ReentrantCallbackGroup()
         self.create_service(
             SetBool,
@@ -188,21 +191,29 @@ class M1AdapterNode(Node):
                 callback_group=self._service_group,
             )
         self.create_service(
+            Trigger,
+            "robot/switch_remote",
+            self._switch_remote,
+            callback_group=self._service_group,
+        )
+        self.create_service(
             SetBool,
             "robot/emergency",
             self._set_emergency,
             callback_group=self._service_group,
         )
 
-        # ---- robot_control service clients -------------------------------
+        # ---- /robot_control service clients ------------------------------
         self._posture_clients = {}
-        for requested, service in POSTURE_SERVICES.items():
+        for service in POSTURE_SERVICES.values():
             name = f"/robot_control/{service}"
             if name in self._posture_clients:
                 continue
             self._posture_clients[name] = self.create_client(Trigger, name)
-        # soft_emergency_stop is std_srvs/SetBool, NOT Trigger.  Getting this
-        # wrong makes the e-stop path silently dead code (hachimi_ws BUGFIX).
+        self._switch_remote_client = self.create_client(
+            Trigger, "/robot_control/switch_remote"
+        )
+        # soft_emergency_stop is std_srvs/SetBool, NOT Trigger.
         self._estop_client = self.create_client(
             SetBool, "/robot_control/soft_emergency_stop"
         )
@@ -219,7 +230,10 @@ class M1AdapterNode(Node):
         self._auto_received_s = float("-inf")
         self._zero_frames_remaining = 0
         self._posture = ""
+        self._machine_status = ""
         self._estop_engaged = False
+        self._hardware_estop_engaged = False
+        self._battery_pct: Optional[float] = None
         self._control_source_name = ""
         self._last_status_s = float("-inf")
         self._last_hold_reason = ""
@@ -237,6 +251,7 @@ class M1AdapterNode(Node):
             f"m1_adapter up: {self.control_rate_hz:.0f} Hz -> {self.cmd_vel_topic}, "
             f"state <- {self.state_topic}, "
             f"watchdog {self.input_watchdog_s:.2f}s, "
+            f"posture_timeout {self.posture_timeout_s:.1f}s, "
             f"clamp linear={self.max_linear or 'off'} angular={self.max_angular or 'off'}"
         )
 
@@ -253,26 +268,46 @@ class M1AdapterNode(Node):
             self._auto_command = command
             self._auto_received_s = time.monotonic()
 
+    def _on_battery(self, message: BatteryState) -> None:
+        pct = float(message.percentage)
+        if not math.isfinite(pct) or pct < 0.0:
+            return
+        # m1_robot_driver publishes BatteryState.percentage in [0.0, 1.0].
+        if pct <= 1.0:
+            pct *= 100.0
+        with self._lock:
+            self._battery_pct = pct
+
     def _on_robot_status(self, message: RobotStatus) -> None:
         posture = normalise_posture(message.motion_status_name)
-        # software_emergency_status is a uint8 where 0 means "not engaged".
-        # Reading the string is friendlier in logs but the number is what we
-        # compare; accept the string spelling too in case it changes.
-        estop = bool(message.software_emergency_status) or (
-            "engage" in str(message.software_emergency_status_name).lower()
-            and "dis" not in str(message.software_emergency_status_name).lower()
+        machine_status = normalise_machine_status(message.machine_status_name)
+        estop = is_estop_engaged(
+            int(message.software_emergency_status),
+            str(message.software_emergency_status_name),
+        )
+        hw_estop = is_estop_engaged(
+            int(message.hardware_emergency_status),
+            str(message.hardware_emergency_status_name),
         )
         with self._lock:
             previous_posture = self._posture
+            previous_machine = self._machine_status
             was_estopped = self._estop_engaged
+            was_hw_estopped = self._hardware_estop_engaged
             self._posture = posture
+            self._machine_status = machine_status
             self._estop_engaged = estop
+            self._hardware_estop_engaged = hw_estop
             self._control_source_name = str(message.control_source_name)
             self._last_status_s = time.monotonic()
         if posture != previous_posture:
             self._event(f"posture -> {posture or 'unknown'}")
+        if machine_status != previous_machine:
+            self._event(f"machine_status -> {machine_status or 'unknown'}")
         if estop != was_estopped:
             self._event(f"software e-stop {'engaged' if estop else 'released'}")
+        if hw_estop != was_hw_estopped:
+            self._event(f"hardware e-stop {'engaged' if hw_estop else 'released'}")
 
     # ------------------------------------------------------------ services
     def _set_manual_enabled(self, request, response):
@@ -299,9 +334,7 @@ class M1AdapterNode(Node):
             self._auto_command = (0.0, 0.0)
             self._manual_received_s = now
             self._auto_received_s = now
-            # Always emit a few explicit zeros after a source change: if the
-            # previous source was mid-command, one zero frame can be lost to a
-            # QoS hiccup and the dog keeps walking.
+            # Always emit a few explicit zeros after a source change.
             self._zero_frames_remaining = max(
                 self._zero_frames_remaining, self.final_zero_frames
             )
@@ -321,21 +354,36 @@ class M1AdapterNode(Node):
 
         return handler
 
+    def _call_trigger_service(
+        self, client, service_name: str, timeout_s: float
+    ) -> tuple[bool, str]:
+        if not client.service_is_ready() and not client.wait_for_service(
+            timeout_sec=2.0
+        ):
+            return (
+                False,
+                f"{service_name} not available -- is m1_robot_driver running?",
+            )
+        future = client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout_s
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done():
+            return (False, f"{service_name} did not answer within {timeout_s:.1f}s")
+        result = future.result()
+        if result is None:
+            return (False, f"{service_name} returned no response")
+        return (bool(result.success), str(result.message))
+
     def _request_posture(self, requested: str, response):
         service = POSTURE_SERVICES[requested]
-        client = self._posture_clients.get(f"/robot_control/{service}")
+        service_name = f"/robot_control/{service}"
+        client = self._posture_clients.get(service_name)
         if client is None:
             response.success = False
             response.message = f"no client for {service}"
             return response
-        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=2.0):
-            response.success = False
-            response.message = (
-                f"/robot_control/{service} not available -- is robot_control running?"
-            )
-            return response
-        # Refuse to change posture while moving: robot_control would accept the
-        # call and the SDK would drop the velocity stream mid-gait.
+        # Refuse to change posture while moving.
         with self._lock:
             self._source = "disabled"
             self._manual_command = (0.0, 0.0)
@@ -343,24 +391,30 @@ class M1AdapterNode(Node):
         self._publish_zero()
         self._publish_source()
 
-        future = client.call_async(Trigger.Request())
-        # Short spin so the Trigger response is filled in; the caller (a service
-        # callback on this node) cannot block the executor indefinitely.
-        deadline = time.monotonic() + 3.0
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not future.done():
-            response.success = False
-            response.message = f"/robot_control/{service} did not answer within 3s"
-            return response
-        if future.result() is None:
-            response.success = False
-            response.message = f"/robot_control/{service} returned no response"
-            return response
-        result = future.result()
-        response.success = bool(result.success)
-        response.message = f"{service}: {result.message}"
-        self._event(f"posture request {requested} -> {service}: {result.message}")
+        ok, msg = self._call_trigger_service(
+            client, service_name, self.posture_timeout_s
+        )
+        response.success = ok
+        response.message = f"{service}: {msg}" if ok else msg
+        self._event(f"posture request {requested} -> {service}: {msg}")
+        return response
+
+    def _switch_remote(self, _request, response):
+        with self._lock:
+            self._source = "disabled"
+            self._manual_command = (0.0, 0.0)
+            self._auto_command = (0.0, 0.0)
+        self._publish_zero()
+        self._publish_source()
+
+        ok, msg = self._call_trigger_service(
+            self._switch_remote_client,
+            "/robot_control/switch_remote",
+            self.posture_timeout_s,
+        )
+        response.success = ok
+        response.message = f"switch_remote: {msg}" if ok else msg
+        self._event(f"switch_remote: {msg}")
         return response
 
     def _set_emergency(self, request, response):
@@ -371,15 +425,14 @@ class M1AdapterNode(Node):
             response.success = False
             response.message = "/robot_control/soft_emergency_stop not available"
             return response
-        # Zero our own output first: the service call may take a moment and we
-        # must not keep streaming velocity into a robot being braked.
+        # Zero our own output first.
         self._set_source("disabled")
         self._publish_zero()
 
         message = SetBool.Request()
         message.data = engage
         future = self._estop_client.call_async(message)
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + self.estop_timeout_s
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.02)
         if not future.done() or future.result() is None:
@@ -394,12 +447,7 @@ class M1AdapterNode(Node):
 
     # ------------------------------------------------------ control ownership
     def _take_control_tick(self) -> None:
-        """Claim SDK control once, retry while it fails.
-
-        An attached phone APP always wins and TakeControl() cannot preempt it
-        (sdk_control_ownership_zh.md).  Retrying is the only option; shouting
-        about it in the log is more useful than failing silently.
-        """
+        """Claim SDK control once, retry while it fails."""
         with self._lock:
             have_control = self._have_control
         if have_control:
@@ -412,7 +460,7 @@ class M1AdapterNode(Node):
         client = self._take_control_client
         if not client.service_is_ready() and not client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn(
-                "/robot_control/take_control not available -- is robot_control running?"
+                "/robot_control/take_control not available -- is m1_robot_driver running?"
             )
             return
         future = client.call_async(Trigger.Request())
@@ -432,7 +480,8 @@ class M1AdapterNode(Node):
                 message = result.message if result is not None else "no response"
                 self.get_logger().warn(
                     "take_control refused (%s). An attached phone APP has priority; "
-                    "close it, or control will not work.", message
+                    "close it, or control will not work.",
+                    message,
                 )
 
         future.add_done_callback(_done)
@@ -441,10 +490,15 @@ class M1AdapterNode(Node):
     def _command_tick(self) -> None:
         now = time.monotonic()
         with self._lock:
+            status_age = now - self._last_status_s
+            status_stale = status_age > self.state_timeout_s
             command = select_command(
                 source=self._source,
                 posture=self._posture,
                 estop_engaged=self._estop_engaged,
+                hardware_estop_engaged=self._hardware_estop_engaged,
+                machine_status=self._machine_status,
+                status_stale=status_stale,
                 manual_command=self._manual_command,
                 manual_age_s=now - self._manual_received_s,
                 auto_command=self._auto_command,
@@ -453,7 +507,6 @@ class M1AdapterNode(Node):
                 max_linear=self.max_linear,
                 max_angular=self.max_angular,
             )
-            status_age = now - self._last_status_s
             if command is not None:
                 self._zero_frames_remaining = self.final_zero_frames
             elif self._zero_frames_remaining > 0:
@@ -463,6 +516,8 @@ class M1AdapterNode(Node):
             reason = stop_reason(
                 posture=self._posture,
                 estop_engaged=self._estop_engaged,
+                hardware_estop_engaged=self._hardware_estop_engaged,
+                machine_status=self._machine_status,
                 last_status_age_s=status_age,
                 status_timeout_s=self.state_timeout_s,
             )
@@ -478,8 +533,6 @@ class M1AdapterNode(Node):
     def _publish_cmd(self, linear: float, angular: float) -> None:
         if not rclpy.ok():
             return
-        # Plain Twist: robot_control subscribes geometry_msgs/Twist (verified on
-        # hardware with `ros2 topic info /cmd_vel -v`).
         twist = Twist()
         twist.linear.x = float(linear)
         twist.angular.z = float(angular)
@@ -500,27 +553,40 @@ class M1AdapterNode(Node):
         now = time.monotonic()
         with self._lock:
             posture = self._posture
+            machine_status = self._machine_status
             estop = self._estop_engaged
+            hw_estop = self._hardware_estop_engaged
+            battery_pct = self._battery_pct
             source = self._source
             status_age = now - self._last_status_s
             control_source_name = self._control_source_name
             have_control = self._have_control
 
+        connected = status_age <= self.state_timeout_s
         reason = stop_reason(
             posture=posture,
             estop_engaged=estop,
+            hardware_estop_engaged=hw_estop,
+            machine_status=machine_status,
             last_status_age_s=status_age,
             status_timeout_s=self.state_timeout_s,
         )
         status = DiagnosticStatus()
-        status.name = "m1_adapter"
+        # vln_web filters diagnostics by status.name == "robot_adapter".
+        status.name = "robot_adapter"
         status.hardware_id = "genisom_m1"
-        if estop:
+        if hw_estop:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "hardware e-stop engaged"
+        elif estop:
             status.level = DiagnosticStatus.ERROR
             status.message = "software e-stop engaged"
-        elif status_age > self.state_timeout_s:
+        elif not connected:
             status.level = DiagnosticStatus.ERROR
             status.message = "no /robot_control/state"
+        elif not machine_status_can_move(machine_status):
+            status.level = DiagnosticStatus.WARN
+            status.message = f"machine_status {machine_status or 'unknown'} is not remote"
         elif not posture_can_move(posture):
             status.level = DiagnosticStatus.WARN
             status.message = f"posture {posture or 'unknown'} cannot move"
@@ -528,10 +594,21 @@ class M1AdapterNode(Node):
             status.level = DiagnosticStatus.OK
             status.message = f"{posture}, {source}"
 
+        motor_state = "ESTOP" if (hw_estop or estop) else ("OK" if connected else "UNKNOWN")
         for key, value in (
+            ("adapter", "m1"),
+            ("connected", str(connected)),
+            ("robot_id", "genisom_m1"),
+            ("mode", posture.upper() if posture else "UNKNOWN"),
+            ("battery", "" if battery_pct is None else f"{battery_pct:.1f}"),
+            ("imu", "OK" if connected else "UNKNOWN"),
+            ("motor", motor_state),
             ("posture", posture or "unknown"),
+            ("machine_status", machine_status or "unknown"),
+            ("remote_ready", str(machine_status_can_move(machine_status))),
             ("can_move", str(posture_can_move(posture))),
             ("estop_engaged", str(estop)),
+            ("hardware_estop_engaged", str(hw_estop)),
             ("control_source", source),
             ("robot_control_source", control_source_name),
             ("sdk_control_acquired", str(have_control)),
@@ -571,9 +648,9 @@ class M1AdapterNode(Node):
 def main(args: Optional[list[str]] = None) -> None:
     rclpy.init(args=args)
     node = M1AdapterNode()
-    # MultiThreadedExecutor: the posture/e-stop service handlers block while
-    # waiting for robot_control's reply, so they must not own the only executor
-    # thread.  Paired with ReentrantCallbackGroup on those services.
+    # MultiThreadedExecutor: the posture/e-stop/switch_remote service handlers
+    # block while waiting for m1_robot_driver's reply, so they must not own the
+    # only executor thread.  Paired with ReentrantCallbackGroup on those services.
     executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)
     try:

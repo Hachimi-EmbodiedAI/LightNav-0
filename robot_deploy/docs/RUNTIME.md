@@ -138,18 +138,20 @@ $PY -m vln_web.web_node
 系统解释器，缺 `casadi`。要么显式 `python -m`，要么把入口脚本的 shebang 改掉
 （见下节）。
 
-### 让 `ros2 run` 也能用
+### 让 `ros2 run` / `ros2 launch` 直接使用 `.venv_ros`
 
-`colcon build` 时指定解释器：
+用 `.venv_ros/bin/python` 驱动 `colcon build`（`ament_python` 会按当前解释器写入 shebang），项目内已提供一键脚本，且不触碰 `hachimi_ws`：
 
 ```bash
-cd /home/jetson/Public/LightNav-0/robot_deploy
-source /opt/ros/humble/setup.bash
-python3 -m colcon build --symlink-install \
-  --cmake-args -DPython3_EXECUTABLE=/home/jetson/Public/LightNav-0/.venv_ros/bin/python
+bash /home/jetson/Public/LightNav-0/robot_deploy/scripts/build_ros.sh
 ```
 
-若 shebang 仍不对，直接用 `python -m` 最稳。
+编译后加载叠加环境即可直接 `ros2 launch`：
+
+```bash
+source /home/jetson/Public/LightNav-0/robot_deploy/scripts/m1_env.sh
+ros2 launch vln_bringup m1.launch.py
+```
 
 ---
 
